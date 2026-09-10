@@ -150,7 +150,7 @@ def main():
     def get_task_url(task):
         try:
             task_id = task.code
-            return f'{URL_SITE}desk/cards?obj==Task:{task_id}'
+            return f'{URL_SITE}desk/cards?obj=Task:{task_id}'
         except Exception as e:
             cmf_alert(f'[ERROR] Ошибка формирования URL задачи: {e}')
             return URL_SITE
@@ -190,7 +190,7 @@ def main():
                 f.write(content)
             cmf_alert(f'Контент письма сохранён: {filename}')
         except Exception as e:
-            cmf_alert(f'[ERROR] Ошибка записи файла лога: {e}')
+            cmf_alert(f'[ERROR] Ошибка записи файла лога: {eсв }')
 
     def send_email(to_email, subject, content):
         """
