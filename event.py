@@ -212,7 +212,7 @@ def main():
 
         try:
             # 2. Вызов корпоративной функции
-            result = cmfutil.send_email(to=to_email, subject=subject, content=content)
+            result = cmfutil.send_email(to=to_email, subject=subject, content=content, cc=[],bcc=[])
             cmf_alert(f'[DEBUG] cmfutil.send_email вернул: {result!r} (тип: {type(result).__name__})')
 
             # 3. Чёткая логика успеха/неудачи
