@@ -1,7 +1,12 @@
 import time
+import os
+from datetime import datetime
+
+
 def main():
-        # === НАСТРОЙКИ ===
+    # === НАСТРОЙКИ ===
     REPORT_EMAILS = [
+        'vakurinalarisa@yandex.ru'
         # 'manager@company.ru',
         # 'product@company.ru',
     ]
@@ -9,412 +14,450 @@ def main():
     MAX_TASKS_PER_EMAIL = 50
     TOP_N_RISK = 10
     PAUSE_BETWEEN_EMAILS_SEC = 1
-    PAGE_SIZE = 500
-    MAX_PAGES = 30
+
+    WRITE_TO_FILE = True
+    EMAIL_LOGS_DIR = 'email_logs'
+    ALERT_FRAGMENT_LEN = 600
+
+    URL_SITE = 'https://eva.local/'
     # ===================
+
     now = g.now()
     today = now.date()
-    cmf_alert(f'[START] Мониторинг запущен. Время: {now.strftime("%Y-%m-%d %H:%M:%S")}')
+    cmf_alert('[START] Мониторинг запущен')
+
+    # --- Вспомогательные функции ---
 
     def parse_to_date(val):
         if val is None:
             return None
-        s = str(val)
-        date_part = s[:10]
-        parts = date_part.split('-')
-        if len(parts) != 3:
-            return None
         try:
+            parts = str(val)[:10].split('-')
+            if len(parts) != 3:
+                return None
             return type(today)(int(parts[0]), int(parts[1]), int(parts[2]))
-        except Exception:
+        except Exception as e:
+            cmf_alert(f'[ERROR] Ошибка парсинга даты: {e}')
             return None
-
-    def get_task_type(task):
-        activity = getattr(task, 'activity', None)
-        if activity:
-            name = getattr(activity, 'name', None)
-            if name:
-                return name
-            code = getattr(activity, 'code', None)
-            if code:
-                return code
-            return str(activity)
-        return 'Не указан'
 
     def get_task_code(task):
-        candidates = ['code', 'external_id', 'number', 'key']
-        for field in candidates:
-            val = getattr(task, field, None)
-            if val:
-                return str(val)
+        for field in ('code', 'external_id', 'number', 'key'):
+            try:
+                val = getattr(task, field, None)
+                if val:
+                    return str(val)
+            except Exception as e:
+                cmf_alert(f'[ERROR] Ошибка получения поля {field}: {e}')
         return '?'
 
-    def get_effective_deadline_date(task):
-        deadline_raw = getattr(task, 'deadline', None)
-        if deadline_raw is not None:
-            return parse_to_date(deadline_raw)
-
-        gantt = getattr(task, 'op_gantt_task', None)
-        if gantt:
-            sched_raw = getattr(gantt, 'sched_finish_date', None)
-            if sched_raw is not None:
-                return parse_to_date(sched_raw)
-        return None
+    def get_deadline_date(task):
+        try:
+            dl = getattr(task, 'deadline', None)
+            if dl is not None:
+                return parse_to_date(dl)
+            gantt = getattr(task, 'op_gantt_task', None)
+            if gantt:
+                return parse_to_date(getattr(gantt, 'sched_finish_date', None))
+            return None
+        except Exception as e:
+            cmf_alert(f'[ERROR] Ошибка получения дедлайна: {e}')
+            return None
 
     def get_deadline_source(task):
-        dl = getattr(task, 'deadline', None)
-        if dl is not None:
-            return f'deadline = {dl}'
-        gantt = getattr(task, 'op_gantt_task', None)
-        if gantt:
-            sched = getattr(gantt, 'sched_finish_date', None)
-            if sched is not None:
-                return f'sched_finish_date = {sched}'
-        return 'не определён'
+        try:
+            if getattr(task, 'deadline', None) is not None:
+                return f'deadline = {task.deadline}'
+            gantt = getattr(task, 'op_gantt_task', None)
+            if gantt and getattr(gantt, 'sched_finish_date', None) is not None:
+                return f'sched_finish_date = {gantt.sched_finish_date}'
+            return 'не определён'
+        except Exception as e:
+            cmf_alert(f'[ERROR] Ошибка определения источника дедлайна: {e}')
+            return 'ошибка определения'
 
     def get_responsible_email(task):
-        responsible = getattr(task, 'responsible', None)
-        if responsible:
-            email = getattr(responsible, 'email', None)
-            if email:
-                return email
-        return None
+        try:
+            responsible = getattr(task, 'responsible', None)
+            if responsible:
+                email = getattr(responsible, 'code', None)
+                if email and '@' in str(email):
+                    return str(email).strip()
+            return None
+        except Exception as e:
+            cmf_alert(f'[ERROR] Ошибка получения email ответственного: {e}')
+            return None
 
     def get_responsible_name(task):
-        responsible = getattr(task, 'responsible', None)
-        if responsible:
-            return getattr(responsible, 'name', '?')
-        return 'не назначен'
+        try:
+            responsible = getattr(task, 'responsible', None)
+            if responsible:
+                name = getattr(responsible, 'name', None)
+                return name if name else '?'
+            return 'не назначен'
+        except Exception as e:
+            cmf_alert(f'[ERROR] Ошибка получения имени ответственного: {e}')
+            return '?'
+
+    def format_task_list(tasks, max_count=MAX_TASKS_PER_EMAIL):
+        """HTML-список задач. Каждая строка — отдельный append с <br>."""
+        if not tasks:
+            return f'<p>Нет задач.</p>'
+
+        lines = []
+        for t in tasks[:max_count]:
+            try:
+                code = get_task_code(t)
+                task_id = t.id
+                status = getattr(t, 'status', None)
+                status_code = getattr(status, 'code', '?') if status else '?'
+                name = t.name
+                source = get_deadline_source(t)
+                task_url = get_task_url(t)
+                lines.append(f'<b>- <a href="{task_url}">{name}</a> (Код: {code}, ID: {task_id})</b><br>')
+                lines.append(f'&nbsp;&nbsp;Статус: {status_code}<br>')
+                lines.append(f'&nbsp;&nbsp;Источник дедлайна: {source}<br>')
+
+                finish = get_deadline_date(t)
+                if finish:
+                    days = (finish - today).days
+                    if days < 0:
+                        lines.append(f'&nbsp;&nbsp;<b>Просрочка: {-days} дн.</b><br>')
+                    else:
+                        lines.append(f'&nbsp;&nbsp;До дедлайна: {days} дн.<br>')
+                else:
+                    lines.append(f'&nbsp;&nbsp;Срок не установлен<br>')
+
+                lines.append(f'<br>')
+            except Exception as e:
+                cmf_alert(f'[ERROR] Ошибка форматирования задачи: {e}')
+                lines.append(f'<p><b>Ошибка отображения задачи</b></p><br>')
+
+        total = len(tasks)
+        if total > max_count:
+            lines.append(
+                f'<i>... и ещё {total - max_count} задач. '
+                f'Полный список: <a href="[ссылка на фильтр в системе]">открыть фильтр</a></i><br>'
+            )
+
+        return ''.join(lines)
+
+    def safe_filename_part(s):
+        s = str(s or '')
+        for ch in ['/', '\\', ':', '?', '*', '"', '<', '>', '|']:
+            s = s.replace(ch, '_')
+        return s[:60]
+
+    def get_task_url(task):
+        try:
+            task_id = task.code
+            return f'{URL_SITE}desk/cards?obj==Task:{task_id}'
+        except Exception as e:
+            cmf_alert(f'[ERROR] Ошибка формирования URL задачи: {e}')
+            return URL_SITE
+
+
+    def write_email_log(prefix, email, subject, content):
+        """Записывает контент письма в файл, если WRITE_TO_FILE=True"""
+        if not WRITE_TO_FILE:
+            return
+
+        try:
+            if email is None:
+                cmf_alert('ПРЕДУПРЕЖДЕНИЕ: email=None, пропускаем запись лога')
+                return
+
+            email_str = str(email).strip()
+            if '@' not in email_str:
+                cmf_alert(f'ПРЕДУПРЕЖДЕНИЕ: некорректный email для лога: {email_str}')
+                email_str = 'unknown'
+
+            if not os.path.exists(EMAIL_LOGS_DIR):
+                os.makedirs(EMAIL_LOGS_DIR, exist_ok=True)
+
+            safe_email = safe_filename_part(email_str)
+            timestamp = now.strftime('%Y%m%d_%H%M%S')
+            filename = f'{EMAIL_LOGS_DIR}/{prefix}_{timestamp}_{safe_email}.html'
+
+            header = (
+                f'Дата: {now}\n'
+                f'Получатель: {email_str}\n'
+                f'Тема: {subject}\n'
+                f'---\n\n'
+            )
+
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(header)
+                f.write(content)
+            cmf_alert(f'Контент письма сохранён: {filename}')
+        except Exception as e:
+            cmf_alert(f'[ERROR] Ошибка записи файла лога: {e}')
+
+    def send_email(to_email, subject, content):
+        """
+        Обёртка вокруг cmfutil.send_email с нормальной диагностикой.
+        Возвращает True только если отправка реально успешна.
+        """
+        # 1. Валидация адреса ДО вызова
+        if not to_email:
+            cmf_alert(f'[ERROR] send_email: to_email пуст')
+            return False
+
+        to_email = str(to_email).strip()
+        if '@' not in to_email or '.' not in to_email.split('@')[-1]:
+            cmf_alert(f'[ERROR] send_email: некорректный email: {to_email!r}')
+            return False
+
+        # Небольшая пауза, если нужно (оставляем как у тебя)
+        time.sleep(PAUSE_BETWEEN_EMAILS_SEC)
+
+        try:
+            # 2. Вызов корпоративной функции
+            result = cmfutil.send_email(to=to_email, subject=subject, content=content)
+            cmf_alert(f'[DEBUG] cmfutil.send_email вернул: {result!r} (тип: {type(result).__name__})')
+
+            # 3. Чёткая логика успеха/неудачи
+            # Если cmfutil возвращает None при успехе — ок. Если True — ок.
+            # Но если это строка, dict, объект — лучше считать это подозрительным,
+            # если у тебя нет точной спецификации.
+            if result is False:
+                cmf_alert(f'[WARN] cmfutil явно сообщил об ошибке отправки на {to_email}')
+                return False
+            if result is None or result is True:
+                # Это те случаи, которые мы считаем успехом
+                cmf_alert(f'ОТПРАВЛЕНО: {subject} → {to_email} (результат: {result!r})')
+                return True
+
+            # Любой другой тип результата — логируем как «неожиданный ответ»
+            cmf_alert(
+                f'[WARN] Неожиданный результат от cmfutil.send_email для {to_email}: {result!r} '
+                f'(тип: {type(result).__name__}). Считаем отправкой НЕуспешной.'
+            )
+            return False
+
+        except Exception as e:
+            # 4. Полный стек ошибки — это самое важное для диагностики
+            import traceback
+            cmf_alert('[ERROR] Исключение при вызове cmfutil.send_email:')
+            cmf_alert(traceback.format_exc())
+            return False
+
+    # --- Получение задач ---
 
     REQUIRED_FIELDS = [
         'name', 'code', 'external_id', 'number', 'key',
         'status.code', 'deadline', 'op_gantt_task.sched_finish_date',
-        'responsible.name', 'responsible.email',
+        'responsible.name', 'responsible.code',
         'activity.name', 'activity.code',
-        'created_at',
-        'id'
+        'created_at', 'id',
     ]
 
-    FILTER_COND = [
-        ['status.code', '==', 'in_progress']
-    ]
+    FILTER_COND = [['status.code', '==', 'in_progress']]
 
-    def get_total_count():
-        """Получает общее количество задач по фильтру."""
-        try:
-            # Пытаемся получить count — название метода зависит от платформы
-            # Вариант 1: models.CmfTask.count(filter=...)
-            if hasattr(models.CmfTask, 'count'):
-                return models.CmfTask.count(filter=FILTER_COND)
-
-            # Вариант 2: models.CmfTask.list() и берём len
-            all_tasks = models.CmfTask.list(filter=FILTER_COND)
-            return len(all_tasks)
-        except Exception as e:
-            cmf_alert(f'Не удалось получить count: {e}. Используем запасной вариант.')
-            try:
-                all_tasks = models.CmfTask.list(filter=FILTER_COND)
-                return len(all_tasks)
-            except Exception as e2:
-                cmf_alert(f'Запасной вариант тоже не сработал: {e2}')
-                return 0
-
-    def fetch_all_tasks(total_count):
-        """
-        Сначала получает count, потом решает: один запрос или пагинация.
-        """
-        all_tasks = []
-
-        if total_count == 0:
-            cmf_alert('Задач по фильтру не найдено.')
-            return []
-
-        cmf_alert(f'Всего задач по фильтру: {total_count}')
-
-        # Если задач немного — берём всё за один запрос
-        if total_count <= PAGE_SIZE * MAX_PAGES:
-            cmf_alert(f'Задач {total_count} <= {PAGE_SIZE * MAX_PAGES} — берём одним запросом.')
-            try:
-                all_tasks = models.CmfTask.list(
-                    filter=FILTER_COND,
-                    fields=REQUIRED_FIELDS,
-                    limit=PAGE_SIZE * MAX_PAGES,
-                    sort=[('created_at', 'DESC')]
-                )
-                cmf_alert(f'Получено задач: {len(all_tasks)}')
-                return all_tasks
-            except Exception as e:
-                cmf_alert(f'Ошибка при запросе: {e}')
-                return []
-
-        # Если задач много — пагинация по курсору (через created_at)
-        cmf_alert(f'Задач {total_count} > {PAGE_SIZE * MAX_PAGES} — включаем пагинацию.')
-
-        last_date = None
-        page_num = 0
-        seen_ids = set()
-
-        while page_num < MAX_PAGES:
-            page_num += 1
-
-            cursor_filter = list(FILTER_COND)  # копируем фильтр
-
-            if last_date is not None:
-                cursor_filter.append(['created_at', '<', last_date])
-
-            try:
-                tasks = models.CmfTask.list(
-                    filter=cursor_filter,
-                    fields=REQUIRED_FIELDS,
-                    limit=PAGE_SIZE,
-                    sort=[('created_at', 'DESC')]
-                )
-            except Exception as e:
-                cmf_alert(f'Ошибка на странице {page_num}: {e}')
-                break
-
-            cmf_alert(f'[DEBUG] Страница {page_num}: получено задач: {len(tasks)}')
-
-            if not tasks:
-                cmf_alert('[DEBUG] Пустая страница — конец данных.')
-                break
-
-            new_tasks = []
-            for t in tasks:
-                if t.id not in seen_ids:
-                    seen_ids.add(t.id)
-                    new_tasks.append(t)
-
-            if not new_tasks:
-                cmf_alert('[DEBUG] Все задачи на странице — дубли. Стоп.')
-                break
-
-            all_tasks.extend(new_tasks)
-            last_date = getattr(tasks[-1], 'created_at', None)
-
-            if last_date is None:
-                cmf_alert('[DEBUG] Нет created_at у последней задачи — курсор недоступен. Стоп.')
-                break
-
-            cmf_alert(f'[DEBUG] Набрано: {len(all_tasks)}, курсор: {last_date}')
-
-        cmf_alert(f'Пагинация завершена. Всего собрано: {len(all_tasks)}')
-        return all_tasks
-
-    def analyze_tasks_sync(threshold_days=1):
-        overdue = []
-        near_deadline = []
-        no_deadline = []
-
-        total_count = get_total_count()
-        tasks = fetch_all_tasks(total_count)
-
-        cmf_alert(f'Начинаем анализ {len(tasks)} задач...')
-
-        for i, task in enumerate(tasks, start=1):
-            task_code = get_task_code(task)
-            cmf_alert(f'--- [{i}/{len(tasks)}] Задача: {task.name} (Код: {task_code}, ID: {task.id}) ---')
-
-            finish_date = get_effective_deadline_date(task)
-
-            if finish_date is None:
-                cmf_alert('  Нет срока — «без срока»')
-                no_deadline.append(task)
-                continue
-
-            try:
-                f_ord = finish_date.toordinal()
-                t_ord = today.toordinal()
-
-                if f_ord < t_ord:
-                    cmf_alert(f'  ПРОСРОЧЕНА. Дедлайн: {finish_date}')
-                    overdue.append(task)
-                else:
-                    days_left = f_ord - t_ord
-                    if days_left <= threshold_days:
-                        cmf_alert(f'  Близка к дедлайну. Осталось: {days_left} дн.')
-                        near_deadline.append(task)
-                    else:
-                        cmf_alert(f'  В норме. Осталось: {days_left} дн.')
-            except Exception as e:
-                cmf_alert(f'  Ошибка сравнения дат: {e}')
-                no_deadline.append(task)
-                continue
-
-        cmf_alert(
-            f'Анализ завершён. Просрочено: {len(overdue)}, '
-            f'Скоро дедлайн: {len(near_deadline)}, Без срока: {len(no_deadline)}'
+    try:
+        cmf_alert('Выполняется запрос задач...')
+        tasks = models.CmfTask.list(
+            filter=FILTER_COND,
+            fields=REQUIRED_FIELDS,
+            slice=[0, 100000],
+            sort=[('created_at', 'DESC')],
         )
-        return overdue, near_deadline, no_deadline
+        cmf_alert(f'Получено задач: {len(tasks)}')
+    except Exception as e:
+        cmf_alert(f'[ERROR] Ошибка при запросе задач: {e}')
+        tasks = []
 
-    def group_by_email(tasks):
-        groups = {}
-        for task in tasks:
-            email = get_responsible_email(task)
-            if not email:
-                email = 'неизвестен'
-            if email not in groups:
-                groups[email] = []
-            groups[email].append(task)
-        return groups
+    # --- Анализ ---
 
-    def format_task_list_brief(tasks, max_count=MAX_TASKS_PER_EMAIL):
-        if not tasks:
-            return 'Нет задач.'
-        lines = []
-        for t in tasks[:max_count]:
-            task_code = get_task_code(t)
-            line = f'{t.name} (Код: {task_code}, ID: {t.id})'
+    threshold_days = 1
+    overdue, near_deadline, no_deadline = [], [], []
 
-            status = getattr(t, 'status', None)
-            status_code = getattr(status, 'code', '?') if status else '?'
-            line += f' — статус: {status_code}'
-
-            source = get_deadline_source(t)
-            line += f', источник: {source}'
-
-            finish_date = get_effective_deadline_date(t)
-            if finish_date:
-                days_overdue = (today - finish_date).days if finish_date < today else 0
-                if days_overdue > 0:
-                    line += f', просрочка: {days_overdue} дн.'
-                else:
-                    days_left = (finish_date - today).days
-                    line += f', до дедлайна: {days_left} дн.'
-            lines.append(line)
-
-        total = len(tasks)
-        if total > max_count:
-            lines.append(f'\n... и ещё {total - max_count} задач. Полный список: [ссылка на фильтр в системе]')
-        return '\n'.join(lines)
-
-    def send_email(to_email, subject, content):
-        if not to_email or '@' not in to_email:
-            cmf_alert(f'ПРЕДУПРЕЖДЕНИЕ: некорректный адрес: {to_email}')
-            return False
-
+    for i, task in enumerate(tasks, start=1):
         try:
-            time.sleep(PAUSE_BETWEEN_EMAILS_SEC)
-            # result = cmfutil.send_email(to=to_email, subject=subject, content=content)
-            result = True  # Эмуляция
+            finish = get_deadline_date(task)
+            task_code = get_task_code(task)
 
-            if result:
-                cmf_alert(f'ОТПРАВЛЕНО: {subject} → {to_email}')
-                return True
-            else:
-                cmf_alert(f'НЕ ОТПРАВЛЕНО: {subject} → {to_email}')
-                return False
+            if finish is None:
+                no_deadline.append(task)
+                continue
+
+            days_left = (finish - today).days
+            if days_left < 0:
+                overdue.append(task)
+            elif days_left <= threshold_days:
+                near_deadline.append(task)
         except Exception as e:
-            cmf_alert(f'Ошибка отправки: {e}')
-            return False
+            cmf_alert(f'[ERROR] Ошибка анализа задачи №{i}: {e}')
 
-    def make_risk_score(task):
-        finish_date = get_effective_deadline_date(task)
-        if finish_date is None:
-            return 9999
-        try:
-            days_overdue = (today - finish_date).days
-            return days_overdue
-        except Exception:
-            return 0
+    cmf_alert(
+        f'Анализ завершён. Просрочено: {len(overdue)}, '
+        f'Скоро дедлайн: {len(near_deadline)}, Без срока: {len(no_deadline)}'
+    )
 
-    def get_top_risk_tasks(tasks, n=TOP_N_RISK):
-        return sorted(tasks, key=make_risk_score, reverse=True)[:n]
+    # --- Отправка отчёта руководству ---
 
     def send_report_to_management(overdue, near_deadline, no_deadline, threshold_days):
         cmf_alert('=== Отправка отчёта руководству ===')
-        report_lines = [
-            'ОТЧЁТ ПО ПОРТФЕЛЮ ЗАДАЧ (активные: in_progress / open)',
-            '',
-            f'Дата формирования: {g.now().strftime("%Y-%m-%d %H:%M")}',
-            f'Порог для «скоро дедлайн»: <= {threshold_days} дн.',
-            f'Логика дедлайна: сначала deadline, если нет — sched_finish_date',
-            '',
-            'СТАТИСТИКА:',
-            f'Просрочено: {len(overdue)}',
-            f'Скоро дедлайн (≤ {threshold_days} дн.): {len(near_deadline)}',
-            f'Без срока: {len(no_deadline)}',
-            '',
-        ]
 
-        if overdue:
-            report_lines.append('ТОП РИСКОВ (самые просроченные):')
-            report_lines.append(format_task_list_brief(get_top_risk_tasks(overdue)))
-            report_lines.append('')
-        else:
-            report_lines.append('Просроченных задач нет.')
-            report_lines.append('')
+        def risk_score(task):
+            try:
+                finish = get_deadline_date(task)
+                return (today - finish).days if finish else 9999
+            except Exception:
+                return 9999
 
-        if near_deadline:
-            report_lines.append('СКОРО ДЕДЛАЙН (топ по сроку):')
-            near_sorted = sorted(
-                near_deadline,
-                key=lambda t: (get_effective_deadline_date(t) or type(today)(1970, 1, 1)),
-                reverse=False
-            )[:TOP_N_RISK]
-            report_lines.append(format_task_list_brief(near_sorted))
-            report_lines.append('')
-        else:
-            report_lines.append('Задач с приближающимся дедлайном нет.')
-            report_lines.append('')
+        lines = []
 
-        if no_deadline:
-            report_lines.append('ЗАДАЧИ БЕЗ СРОКА (топ):')
-            report_lines.append(format_task_list_brief(no_deadline[:TOP_N_RISK]))
-            report_lines.append('')
-        else:
-            report_lines.append('У всех задач есть срок.')
-            report_lines.append('')
+        try:
+            lines.append(f'<h2>ОТЧЁТ ПО ПОРТФЕЛЮ ЗАДАЧ (активные: in_progress)</h2>')
+            lines.append(f'<hr>')
+            lines.append(f'Дата формирования: {now.strftime("%Y-%m-%d %H:%M")}<br>')
+            lines.append(f'Порог «скоро дедлайн»: &le; {threshold_days} дн.<br>')
+            lines.append(f'Логика дедлайна: сначала deadline, если нет — sched_finish_date<br>')
+            lines.append(f'<br>')
+            lines.append(f'<b>Просрочено:</b> {len(overdue)}<br>')
+            lines.append(f'<b>Скоро дедлайн</b> (&le; {threshold_days} дн.): {len(near_deadline)}<br>')
+            lines.append(f'<b>Без срока:</b> {len(no_deadline)}<br>')
+            lines.append(f'<hr>')
 
-        report_content = '\n'.join(report_lines)
-        subject = f'Отчёт по портфелю: просрочено={len(overdue)}, скоро={len(near_deadline)}, без срока={len(no_deadline)}'
+            if overdue:
+                lines.append(f'<h3>ТОП РИСКОВ (самые просроченные):</h3>')
+                lines.append(format_task_list(sorted(overdue, key=risk_score, reverse=True)[:TOP_N_RISK]))
+                lines.append(f'<br>')
+            else:
+                lines.append(f'<p>Просроченных задач нет.</p>')
+                lines.append(f'<br>')
 
-        sent_count = 0
-        for email in REPORT_EMAILS:
-            if send_email(email, subject, report_content):
-                sent_count += 1
-        cmf_alert(f'Отчёт руководству: отправлено на {sent_count}/{len(REPORT_EMAILS)} адресов.')
+            if near_deadline:
+                lines.append(f'<h3>СКОРО ДЕДЛАЙН:</h3>')
+                near_sorted = sorted(near_deadline, key=lambda t: get_deadline_date(t) or type(today)(1970, 1, 1))
+                lines.append(format_task_list(near_sorted[:TOP_N_RISK]))
+                lines.append(f'<br>')
+            else:
+                lines.append(f'<p>Задач с приближающимся дедлайном нет.</p>')
+                lines.append(f'<br>')
+
+            if no_deadline:
+                lines.append(f'<h3>ЗАДАЧИ БЕЗ СРОКА (топ):</h3>')
+                lines.append(format_task_list(no_deadline[:TOP_N_RISK]))
+                lines.append(f'<br>')
+            else:
+                lines.append(f'<p>У всех задач есть срок.</p>')
+                lines.append(f'<br>')
+
+            content = ''.join(lines)
+            subject = (f'Отчёт по портфелю: просрочено={len(overdue)}, '
+                       f'скоро={len(near_deadline)}, без срока={len(no_deadline)}')
+
+            sent = 0
+            for email in REPORT_EMAILS:
+                write_email_log('mgmt_report', email, subject, content)
+
+                fragment = content[:ALERT_FRAGMENT_LEN] + ('...' if len(content) > ALERT_FRAGMENT_LEN else '')
+                cmf_alert(f'--- Фрагмент контента (руководство) для {email} ---\n{fragment}\n--- Конец фрагмента ---')
+
+                if send_email(email, subject, content):
+                    sent += 1
+
+            cmf_alert(f'Отчёт руководству: отправлено на {sent}/{len(REPORT_EMAILS)} адресов.')
+        except Exception as e:
+            cmf_alert(f'[ERROR] Критическая ошибка при формировании отчёта для руководства: {e}')
+
+    # --- Отправка уведомлений исполнителям ---
 
     def send_notifications_to_responsible(overdue, near_deadline, no_deadline, threshold_days):
         cmf_alert('=== Отправка уведомлений исполнителям ===')
-        stats = {'sent': 0, 'failed': 0}
 
-        if overdue:
-            groups = group_by_email(overdue)
-            for email, tasks in groups.items():
-                content = 'СРОЧНО: Просроченные задачи:\n\n' + format_task_list_brief(tasks)
-                if send_email(email, 'СРОЧНО: Просроченные задачи', content):
-                    stats['sent'] += 1
+        by_email = {}
+
+        try:
+            for task in overdue + near_deadline + no_deadline:
+                email = get_responsible_email(task)
+                if not email:
+                    cmf_alert(
+                        f'У задачи "{task.name}" (код: {get_task_code(task)}) '
+                        f'нет email ответственного — уведомление не отправляется'
+                    )
+                    continue
+                name = get_responsible_name(task)
+                if email not in by_email:
+                    by_email[email] = {
+                        'name': name,
+                        'overdue': [],
+                        'near_deadline': [],
+                        'no_deadline': [],
+                    }
+
+                if task in overdue:
+                    by_email[email]['overdue'].append(task)
+                elif task in near_deadline:
+                    by_email[email]['near_deadline'].append(task)
                 else:
-                    stats['failed'] += 1
+                    by_email[email]['no_deadline'].append(task)
+        except Exception as e:
+            cmf_alert(f'[ERROR] Ошибка группировки задач по ответственным: {e}')
+            return
 
-        if near_deadline:
-            groups = group_by_email(near_deadline)
-            for email, tasks in groups.items():
-                content = f'Срок завершения приближается (осталось ≤ {threshold_days} дн.):\n\n' + format_task_list_brief(tasks)
-                if send_email(email, f'Дедлайн скоро: {len(tasks)} задач', content):
-                    stats['sent'] += 1
+        sent, failed = 0, 0
+
+        for email, data in by_email.items():
+            try:
+                lines = []
+
+                lines.append(f'<h2>Сводка по задачам — {data["name"]}</h2>')
+                lines.append(f'<hr>')
+
+                if data['overdue']:
+                    lines.append(f'<h3>ПРОСРОЧЕННЫЕ ЗАДАЧИ:</h3>')
+                    lines.append(format_task_list(data['overdue']))
+                    lines.append(f'<br>')
+
+                if data['near_deadline']:
+                    lines.append(f'<h3>СКОРО ДЕДЛАЙН (&le; {threshold_days} дн.):</h3>')
+                    lines.append(format_task_list(data['near_deadline']))
+                    lines.append(f'<br>')
+
+                if data['no_deadline']:
+                    lines.append(f'<h3>ЗАДАЧИ БЕЗ СРОКА:</h3>')
+                    lines.append(format_task_list(data['no_deadline']))
+                    lines.append(f'<br>')
+
+                if len(lines) <= 2:
+                    continue
+
+                content = ''.join(lines)
+                subject = (
+                    f'Сводка по вашим задачам: просрочено={len(data["overdue"])}, '
+                    f'скоро={len(data["near_deadline"])}, без срока={len(data["no_deadline"])}'
+                )
+
+                cmf_alert(
+                    f'Отправка исполнителю: {data["name"]} <{email}> — '
+                    f'просрочено: {len(data["overdue"])}, '
+                    f'скоро: {len(data["near_deadline"])}, '
+                    f'без срока: {len(data["no_deadline"])}'
+                )
+
+                write_email_log('resp_notify', email, subject, content)
+
+                fragment = content[:ALERT_FRAGMENT_LEN] + ('...' if len(content) > ALERT_FRAGMENT_LEN else '')
+                cmf_alert(f'--- Фрагмент контента (исполнитель) для {email} ---\n{fragment}\n--- Конец фрагмента ---')
+
+                if send_email(email, subject, content):
+                    sent += 1
                 else:
-                    stats['failed'] += 1
+                    failed += 1
+            except Exception as e:
+                cmf_alert(f'[ERROR] Ошибка при отправке уведомления исполнителю {email}: {e}')
+                failed += 1
 
-        if no_deadline:
-            groups = group_by_email(no_deadline)
-            for email, tasks in groups.items():
-                content = 'Задачи без установленного срока:\n\n' + format_task_list_brief(tasks)
-                if send_email(email, f'Задачи без срока: {len(tasks)} шт.', content):
-                    stats['sent'] += 1
-                else:
-                    stats['failed'] += 1
+        cmf_alert(f'Уведомления исполнителям: отправлено={sent}, ошибок={failed}')
 
-        cmf_alert(f'Уведомления исполнителям: отправлено={stats["sent"]}, ошибок={stats["failed"]}')
+    # --- Запуск ---
 
-    def process_all_sync(threshold_days=1):
-        overdue, near_deadline, no_deadline = analyze_tasks_sync(threshold_days)
-        send_report_to_management(overdue, near_deadline, no_deadline, threshold_days)
-        send_notifications_to_responsible(overdue, near_deadline, no_deadline, threshold_days)
-    process_all_sync()
+    send_report_to_management(overdue, near_deadline, no_deadline, threshold_days)
+    send_notifications_to_responsible(overdue, near_deadline, no_deadline, threshold_days)
 
-    cmf_alert(f'[END] Мониторинг завершён. Время: {g.now().strftime("%Y-%m-%d %H:%M:%S")}')
+    cmf_alert('[END] Мониторинг завершён')
 
 
 main()
